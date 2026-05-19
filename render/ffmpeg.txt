@@ -1,0 +1,23 @@
+# After downloading hemostasis_frames.zip from the browser:
+
+# 1. Unzip
+unzip hemostasis_frames.zip
+
+# 2. Convert to MP4 (publication quality)
+ffmpeg -framerate 30 -i frames/frame_%04d.png \
+  -c:v libx264 -crf 18 -pix_fmt yuv420p output.mp4
+
+# CRF guide: 18 = high quality, 23 = default, 28 = smaller file
+# Change -framerate to match your actual FPS (e.g. 15, 25, 30)
+
+# 3. (Optional) Convert to lossless for editing
+ffmpeg -framerate 30 -i frames/frame_%04d.png \
+  -c:v ffv1 output_lossless.mkv
+
+# 4. (Optional) Trim to specific frame range
+ffmpeg -framerate 30 -start_number 0010 -i frames/frame_%04d.png \
+  -frames:v 60 -c:v libx264 -crf 18 -pix_fmt yuv420p output_trimmed.mp4
+
+# Serve with:
+#   cd hemostasis && python3 -m http.server 8000
+# Then open: http://localhost:8000/render/

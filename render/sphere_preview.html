@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Sphere Preview</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #111; font-family: 'Courier New', monospace; color: #ccc; overflow: hidden; }
+    canvas { display: block; width: 100vw; height: calc(100vh - 48px); }
+    #bar {
+      position: fixed; bottom: 0; left: 0; right: 0; height: 48px;
+      background: #1a1a1a; border-top: 1px solid #333;
+      display: flex; align-items: center; gap: 8px; padding: 0 12px; font-size: 12px;
+    }
+    button {
+      background: #2a2a2a; color: #ccc; border: 1px solid #444;
+      padding: 4px 10px; cursor: pointer; border-radius: 3px; font-size: 12px;
+    }
+    button:hover { background: #383838; }
+    #slider { flex: 1; accent-color: #c8e44e; cursor: pointer; }
+    #info { min-width: 160px; color: #888; font-size: 11px; }
+    #src-label { color: #c8e44e; font-size: 11px; }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="bar">
+  <button id="btnPlay">▶</button>
+  <input type="range" id="slider" min="0" max="0" value="0" disabled>
+  <div id="info">Loading…</div>
+  <span id="src-label"></span>
+  <button id="btn15" title="Load 15mm sphere">15mm</button>
+  <button id="btn20" title="Load 20mm sphere">20mm</button>
+</div>
+
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.157/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.157/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const canvas  = document.getElementById('c');
+const slider  = document.getElementById('slider');
+const info    = document.getElementById('info');
+const btnPlay = document.getElementById('btnPlay');
+const srcLabel = document.getElementById('src-label');
+
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.3;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a1a);
+
+const key = new THREE.SpotLight(0xffffff, 8.0);
+key.position.set(1.2, 1.5, 1.0); key.angle = Math.PI/5; key.penumbra = 0.45;
+key.decay = 2; key.castShadow = true; key.shadow.mapSize.set(2048, 2048); key.shadow.radius = 3; key.shadow.bias = -0.0003;
+key.shadow.camera.near = 0.1; key.shadow.camera.far = 10;
+scene.add(key, key.target);
+const fill = new THREE.DirectionalLight(0xffeedd, 1.0);
+fill.position.set(-1.5, 0.5, 0.8);
+scene.add(fill);
+const rim = new THREE.DirectionalLight(0xaaccff, 0.6);
+rim.position.set(0.5, -0.5, -2.0);
+scene.add(rim);
+scene.add(new THREE.AmbientLight(0xffffff, 0.28));
+
+const camera = new THREE.PerspectiveCamera(14, 1, 0.001, 2000);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true; controls.dampingFactor = 0.08;
+
+const mat = new THREE.MeshPhysicalMaterial({
+  color: new THREE.Color(0x7ce3df), roughness: 0.52, metalness: 0.0,
+  clearcoat: 0.08, clearcoatRoughness: 0.55,
+  side: THREE.DoubleSide, envMapIntensity: 0.18,
+});
+
+let mesh = null;
+let sphereData = null;
+let playing = false, currentFrame = 0, playT0 = 0, playF0 = 0, fps = 30;
+
+function loadSphere(path, label) {
+  info.textContent = 'Loading…';
+  srcLabel.textContent = label;
+  slider.disabled = true;
+  btnPlay.disabled = true;
+  fetch(path).then(r => r.json()).then(data => {
+    sphereData = data;
+    fps = data.fps || 30;
+
+    if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); mesh = null; }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(data.frames[0]), 3));
+    const idx = [];
+    for (const f of data.faces) idx.push(f[0], f[1], f[2]);
+    // Close the pole cap: j=0 row was omitted from face generation — add fan triangles
+    const nS = data.n_strips, pS = data.pts_per_strip;
+    if (nS && pS) {
+      for (let si = 0; si < nS; si++) {
+        const b0 = si * pS, b1 = ((si + 1) % nS) * pS;
+        idx.push(b0, b0 + 1, b1 + 1);
+      }
+    }
+    geo.setIndex(idx);
+    geo.computeVertexNormals();
+    geo.computeBoundingSphere();
+
+    mesh = new THREE.Mesh(geo, mat);
+    mesh.castShadow = true; mesh.receiveShadow = true;
+    scene.add(mesh);
+
+    // Fit camera
+    const bs = geo.boundingSphere;
+    camera.position.set(bs.center.x, bs.center.y + bs.radius * 0.1, bs.center.z + bs.radius * 13);
+    camera.near = bs.radius * 0.01; camera.far = bs.radius * 500;
+    camera.updateProjectionMatrix();
+    controls.target.copy(bs.center);
+    controls.update();
+
+    slider.max = data.frames.length - 1;
+    slider.value = 0;
+    slider.disabled = false;
+    btnPlay.disabled = false;
+    currentFrame = 0;
+    showFrame(0);
+
+    const cx = data.center[0].toFixed(2), cy = data.center[1].toFixed(2), cz = data.center[2].toFixed(2);
+    info.textContent = `${data.frames.length} frames · r=${data.radius.toFixed(1)} · c=(${cx},${cy},${cz})`;
+  }).catch(err => {
+    info.textContent = `Error: ${err.message}`;
+  });
+}
+
+function showFrame(f) {
+  if (!sphereData || !mesh) return;
+  currentFrame = f;
+  slider.value = f;
+  const flat = sphereData.frames[Math.min(f, sphereData.frames.length - 1)];
+  mesh.geometry.attributes.position.array.set(flat);
+  mesh.geometry.attributes.position.needsUpdate = true;
+  mesh.geometry.computeVertexNormals();
+}
+
+btnPlay.onclick = () => {
+  playing = !playing;
+  if (playing) { playT0 = performance.now(); playF0 = currentFrame; }
+  btnPlay.textContent = playing ? '⏸' : '▶';
+};
+
+slider.oninput = () => {
+  playing = false;
+  btnPlay.textContent = '▶';
+  showFrame(+slider.value);
+};
+
+document.getElementById('btn15').onclick = () => loadSphere('/render/sphere_3D_mesh_15.json', '15mm');
+document.getElementById('btn20').onclick = () => loadSphere('/render/sphere_3D_mesh_20.json', '20mm');
+
+function resize() {
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  renderer.setSize(W, H, false);
+  camera.aspect = W / H;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Auto-load based on URL param
+const size = new URLSearchParams(location.search).get('size') || '20';
+loadSphere(`/render/sphere_3D_mesh_${size}.json`, `${size}mm`);
+
+function animate(ts) {
+  requestAnimationFrame(animate);
+  if (playing && sphereData) {
+    const elapsed = (ts - playT0) / 1000;
+    let f = Math.floor(playF0 + elapsed * fps);
+    if (f >= sphereData.frames.length) { playT0 = ts; playF0 = 0; f = 0; }
+    showFrame(f);
+  }
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate(0);
+</script>
+</body>
+</html>

@@ -1,0 +1,1435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Hemostasis — Experiment vs Simulation</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #f0f0f0; font-family: 'Courier New', monospace; overflow: hidden; }
+
+    #panels {
+      position: fixed; inset: 0 0 52px 0;
+      display: flex;
+    }
+    .panel-wrap {
+      flex: 1; position: relative; overflow: hidden; background: #fff;
+    }
+    .panel-wrap + .panel-wrap { border-left: 2px solid #ccc; }
+
+    canvas.three { display: block; width: 100%; height: 100%; }
+
+    .panel-label {
+      position: absolute; top: 60px; left: 0; right: 0;
+      text-align: center; font-size: 50px; font-weight: bold;
+      letter-spacing: .12em; color: #444; pointer-events: none;
+      text-transform: uppercase;
+    }
+    .panel-label span {
+      background: rgba(255,255,255,.75); padding: 8px 24px; border-radius: 8px;
+    }
+
+    #bar {
+      position: fixed; bottom: 0; left: 0; right: 0; height: 52px;
+      background: #ebebeb; border-top: 1px solid #ccc;
+      display: flex; align-items: center; gap: 8px; padding: 0 14px;
+      color: #333; font-size: 12px;
+    }
+    button {
+      background: #e0e0e0; color: #333; border: 1px solid #bbb;
+      padding: 5px 12px; cursor: pointer; border-radius: 3px; font-size: 12px;
+      white-space: nowrap;
+    }
+    button:hover { background: #d0d0d0; }
+    button:disabled { opacity: .35; cursor: default; }
+    button.linked { background: #1a3a1a; border-color: #2d6b2d; color: #88dd88; }
+    .size-btn.active { background: #18304d; border-color: #305985; color: #a5cdf8; }
+    #slider { flex: 1; accent-color: #c8e44e; cursor: pointer; min-width: 60px; }
+    #frame-info { min-width: 130px; color: #666; font-size: 11px; }
+  </style>
+</head>
+<body>
+
+<div id="panels">
+  <div class="panel-wrap" id="left-wrap">
+    <canvas id="left-canvas" class="three"></canvas>
+    <div class="panel-label"><span>Experiment</span></div>
+  </div>
+  <div class="panel-wrap" id="right-wrap">
+    <canvas id="right-canvas" class="three"></canvas>
+    <div class="panel-label"><span>Simulation</span></div>
+  </div>
+</div>
+
+<div id="bar">
+  <button id="btnPlay" disabled>▶</button>
+  <input type="range" id="slider" min="0" max="0" value="0" disabled>
+  <div id="frame-info">Loading…</div>
+  <button id="btnSize20" class="size-btn" title="Switch to 20mm assets">20mm</button>
+  <button id="btnSize15" class="size-btn" title="Switch to 15mm assets">15mm</button>
+  <button id="btnZoomLink" title="Toggle linked zoom size">🔍 Link Zoom</button>
+  <button id="btnSphere" title="Toggle sphere shell visibility">Hide Sphere</button>
+  <button id="btnAssembly1" title="Toggle cylinder visibility">Hide Cylinder</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three":         "https://cdn.jsdelivr.net/npm/three@0.157/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.157/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls }        from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader }           from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader }          from 'three/addons/loaders/DRACOLoader.js';
+import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
+
+const SIZE_CONFIGS = {
+  '20': {
+    key: '20',
+    label: '20mm',
+    cylinderPath: '/render/cylinder_20.gltf',
+    cylinderAnchorNames: ['20mm'],
+    assembly1Backoff: -81.5,
+    experimentDotPaths: ['/render/experiment_20mm.json'],
+    simulationDotPaths: ['/render/simulation_20mm.json'],
+  },
+  '15': {
+    key: '15',
+    label: '15mm',
+    cylinderPath: '/render/cylinder_15.gltf',
+    cylinderAnchorNames: ['15mm', 'occurrence of 15mm'],
+    placementAnchorNames: ['15mm', 'occurrence of 15mm'],
+    assembly1Backoff: -82.0,
+    experimentDotPaths: ['/render/experiment_15mm.json'],
+    simulationDotPaths: ['/render/simulation_15mm.json'],
+  },
+};
+
+function getSelectedSizeKey() {
+  const size = new URLSearchParams(window.location.search).get('size');
+  return SIZE_CONFIGS[size] ? size : '20';
+}
+
+const ACTIVE_SIZE = SIZE_CONFIGS[getSelectedSizeKey()];
+
+function findFirstNamedObject(root, names) {
+  for (const name of names || []) {
+    const found = root.getObjectByName(name);
+    if (found) return found;
+  }
+  return null;
+}
+
+let gltfAssemblyScene = null;
+let assemblySphereCenter = null;
+let assemblySphereRadius = 1;
+let assemblySphereHemiDir = null;
+let assemblySphereTU = null;
+let assemblySphereTV = null;
+const ASSEMBLY_BACKOFF = 0.0205;
+const ASSEMBLY_INWARD_BIAS = 0.02;
+const ASSEMBLY_SPHERE_MATERIAL = '0.415686_0.964706_0.709804_0.000000_0.000000';
+const ASSEMBLY_FLIP = true;
+const ASSEMBLY1_ALIGN_OFFSET_X = 0.0;
+const ASSEMBLY1_ALIGN_OFFSET_Y = 0.0;
+const ASSEMBLY1_FLIP = true;
+const CENTER_PATCH_RADIUS_RATIO = 0.15;
+const MEMBRANE_MASK_SCALE = 0.78; // render-only: clamp membrane display further inside the sphere cut
+
+function isAssemblySphereMesh(obj) {
+  if (!obj?.isMesh) return false;
+  const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+  return materials.some(mat => mat?.name === ASSEMBLY_SPHERE_MATERIAL);
+}
+
+let gltfAssembly1Scene = null;
+
+const gltfAssembly1Ready = new Promise(resolve => {
+  const loader = new GLTFLoader();
+  const draco = new DRACOLoader();
+  draco.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
+  loader.setDRACOLoader(draco);
+  loader.load(ACTIVE_SIZE.cylinderPath, gltf => {
+    gltfAssembly1Scene = gltf.scene;
+    resolve(gltf.scene);
+  }, undefined, () => resolve(null));
+});
+
+const gltfAssemblyReady = new Promise(resolve => {
+  const loader = new GLTFLoader();
+  const draco = new DRACOLoader();
+  draco.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/');
+  loader.setDRACOLoader(draco);
+  loader.load('/render/membrane.gltf', gltf => {
+    gltf.scene.updateMatrixWorld(true);
+    const verts = [];
+    const tmp = new THREE.Vector3();
+    gltf.scene.traverse(obj => {
+      if (!isAssemblySphereMesh(obj)) return;
+      const pos = obj.geometry?.attributes?.position;
+      if (!pos) return;
+      for (let i = 0; i < pos.count; i++) {
+        tmp.fromBufferAttribute(pos, i).applyMatrix4(obj.matrixWorld);
+        verts.push(tmp.x, tmp.y, tmp.z);
+      }
+    });
+    if (verts.length >= 12) {
+      const fit = fitSphere(new Float32Array(verts));
+      assemblySphereCenter = fit.center;
+      assemblySphereRadius = fit.radius;
+      const centroid = new THREE.Vector3();
+      for (let i = 0; i < verts.length; i += 3) {
+        centroid.x += verts[i];
+        centroid.y += verts[i + 1];
+        centroid.z += verts[i + 2];
+      }
+      centroid.multiplyScalar(1 / (verts.length / 3));
+      assemblySphereHemiDir = centroid.sub(fit.center).normalize();
+      const up2 = Math.abs(assemblySphereHemiDir.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+      assemblySphereTU = new THREE.Vector3().crossVectors(assemblySphereHemiDir, up2).normalize();
+      assemblySphereTV = new THREE.Vector3().crossVectors(assemblySphereHemiDir, assemblySphereTU).normalize();
+    }
+    gltfAssemblyScene = gltf.scene;
+    resolve(gltf.scene);
+  }, undefined, () => resolve(null));
+});
+
+// ── Sphere fit ────────────────────────────────────────────────────────────────
+function gaussSolve(A, b) {
+  const n=4, M=A.map((row,i)=>[...row,b[i]]);
+  for(let col=0;col<n;col++){
+    let max=col;
+    for(let row=col+1;row<n;row++) if(Math.abs(M[row][col])>Math.abs(M[max][col])) max=row;
+    [M[col],M[max]]=[M[max],M[col]];
+    const piv=M[col][col]; if(Math.abs(piv)<1e-12) continue;
+    for(let row=0;row<n;row++){
+      if(row===col) continue;
+      const f=M[row][col]/piv;
+      for(let k=col;k<=n;k++) M[row][k]-=f*M[col][k];
+    }
+  }
+  return M.map((row,i)=>row[n]/row[i]);
+}
+function fitSphere(pos) {
+  const n=pos.length/3, mat=[[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]], rhs=[0,0,0,0];
+  for(let i=0;i<n;i++){
+    const x=pos[i*3],y=pos[i*3+1],z=pos[i*3+2],w=x*x+y*y+z*z,row=[x,y,z,1];
+    for(let j=0;j<4;j++){rhs[j]+=row[j]*w;for(let k=0;k<4;k++) mat[j][k]+=row[j]*row[k];}
+  }
+  const sol=gaussSolve(mat,rhs),cx=sol[0]/2,cy=sol[1]/2,cz=sol[2]/2;
+  return { center:new THREE.Vector3(cx,cy,cz), radius:Math.sqrt(Math.max(0,sol[3]+cx*cx+cy*cy+cz*cz)) };
+}
+
+// ── Panel class ───────────────────────────────────────────────────────────────
+const M_BIN = 32;
+const GT_APPROACH_S = 1.0;
+const GT_HOLD_S = 1.8;
+const GT_RETURN_S = 1.0;
+
+class Panel {
+  constructor(canvas, wrap, memColor) {
+    this.canvas   = canvas;
+    this.wrap     = wrap;
+    this.meshData = null;
+
+    // Per-panel materials (separate instances so shaders don't share uniforms)
+    this.membraneMat = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color(memColor), roughness:0.38, metalness:0.0,
+      clearcoat:0.25, clearcoatRoughness:0.3,
+      side:THREE.DoubleSide, envMapIntensity:0.6, transparent:true,
+    });
+    this.sphereBackMat = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color(0x6af6b5), roughness:0.38, metalness:0.0,
+      clearcoat:0.25, clearcoatRoughness:0.3,
+      side:THREE.DoubleSide, envMapIntensity:0.6, depthWrite:true, transparent:false, opacity:1.0,
+    });
+
+    // Renderer
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias:true, preserveDrawingBuffer:true });
+    this.renderer.localClippingEnabled = true;
+    this.renderer.setPixelRatio(window.devicePixelRatio);
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.1;
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    // Scene
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0xffffff);
+    const key = new THREE.SpotLight(0xffffff, 6.0);
+    key.position.set(0.3,2.0,1.2); key.angle=Math.PI/5; key.penumbra=0.45;
+    key.decay=2; key.castShadow=true; key.shadow.mapSize.set(2048,2048); key.shadow.bias=-0.0005;
+    this.scene.add(key, key.target);
+    const fill = new THREE.DirectionalLight(0xffeedd,1.0); fill.position.set(-1.5,0.5,-0.8); this.scene.add(fill);
+    const rim  = new THREE.DirectionalLight(0xaaccff,0.6); rim.position.set(0.5,-0.5,-2.0);  this.scene.add(rim);
+    this.scene.add(new THREE.AmbientLight(0xffffff,0.6));
+
+    // Camera + controls
+    this.camera = new THREE.PerspectiveCamera(12, 1, 0.001, 1000);
+    this.controls = new OrbitControls(this.camera, canvas);
+    this.controls.enableDamping = true; this.controls.dampingFactor = 0.08;
+    this.controls.minDistance = 0.001; this.controls.maxDistance = Infinity;
+    this.controls.enablePan = true;
+    this.controls.screenSpacePanning = true;
+    this.controls.panSpeed = 1.1;
+
+    // Per-panel state
+    this.membraneObj      = null;
+    this.sphereBackObj    = null;
+    this.sphereVerts0     = null;
+    this.sphereFitCenter  = null;
+    this.sphereHemiDir    = null;
+    this.sphereInscribedDot = 0;
+    this.sphereRadius     = 0;
+    this.sphereTU         = null;
+    this.sphereTV         = null;
+    this._memUniforms     = null;
+    this._sphUniforms     = null;
+    this.circleScale      = 1.04;
+    this.mDir0            = null;
+    this.mBins            = null;
+    this.assemblyObj      = null;
+    this.assembly1Obj     = null;
+    this.assembly1GuideObj = null;
+    this.centerPatchIndices = null;
+    this.centerPatchR0 = null;
+    this.membraneBasePosition = null;
+    this.sphereBackBasePosition = null;
+    this.assemblyBasePosition = null;
+    this.assemblyMotionDir = null;
+    this.assembly1Scale = 1;
+  }
+
+  createMembraneFromData(data) {
+    if (this.membraneObj)  { this.scene.remove(this.membraneObj.mesh);  this.membraneObj.geo.dispose(); }
+    if (this.sphereBackObj){ this.scene.remove(this.sphereBackObj);     this.sphereBackObj.geometry.dispose(); }
+    if (this.assemblyObj)  { this.scene.remove(this.assemblyObj);       this.assemblyObj = null; }
+    if (this.assembly1GuideObj) { this.scene.remove(this.assembly1GuideObj); this.assembly1GuideObj = null; }
+    const isDotSource = data?.source === 'visuoshell_3d_dot';
+    this.circleScale = 1.04;
+
+    const geo   = new THREE.BufferGeometry();
+    const verts = new Float32Array(data.frames[0]);
+    geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+    geo.setIndex(data.faces.flat());
+    geo.computeVertexNormals();
+
+    const mesh = new THREE.Mesh(geo, this.membraneMat);
+    mesh.castShadow = true; mesh.receiveShadow = true;
+    this.scene.add(mesh);
+    this.membraneObj = { geo, mesh };
+    this.membraneBasePosition = mesh.position.clone();
+    geo.computeBoundingSphere();
+
+    const fit = fitSphere(verts);
+    const nv  = verts.length / 3;
+
+    let cx=0,cy=0,cz=0,sumDist=0;
+    for(let i=0;i<nv;i++){
+      cx+=verts[i*3]; cy+=verts[i*3+1]; cz+=verts[i*3+2];
+      const dx=verts[i*3]-fit.center.x, dy=verts[i*3+1]-fit.center.y, dz=verts[i*3+2]-fit.center.z;
+      sumDist+=Math.sqrt(dx*dx+dy*dy+dz*dz);
+    }
+    const centroid  = new THREE.Vector3(cx/nv, cy/nv, cz/nv);
+    const radius    = sumDist / nv;
+    const hemiDir   = new THREE.Vector3().subVectors(centroid, fit.center).normalize();
+    const clipPt    = new THREE.Vector3().copy(fit.center).addScaledVector(hemiDir, radius*0.05);
+    const plane1    = new THREE.Plane(hemiDir, -hemiDir.dot(clipPt));
+
+    const up2 = Math.abs(hemiDir.y)<0.9 ? new THREE.Vector3(0,1,0) : new THREE.Vector3(1,0,0);
+    const tU  = new THREE.Vector3().crossVectors(hemiDir, up2).normalize();
+    const tV  = new THREE.Vector3().crossVectors(hemiDir, tU);
+    let minU=Infinity,maxU=-Infinity,minV=Infinity,maxV=-Infinity;
+    for(let i=0;i<nv;i++){
+      const dx=verts[i*3]-centroid.x, dy=verts[i*3+1]-centroid.y, dz=verts[i*3+2]-centroid.z;
+      const u=dx*tU.x+dy*tU.y+dz*tU.z, v=dx*tV.x+dy*tV.y+dz*tV.z;
+      if(u<minU)minU=u; if(u>maxU)maxU=u; if(v<minV)minV=v; if(v>maxV)maxV=v;
+    }
+    const inscribedR   = Math.min((maxU-minU)/2,(maxV-minV)/2)*this.circleScale;
+    const inscribedDot = Math.sqrt(Math.max(0, 1-(inscribedR/radius)**2));
+
+    this.sphereBackMat.clippingPlanes = [plane1];
+
+    // Membrane shader (circle clip + edge fade)
+    const _cc=fit.center.clone().addScaledVector(hemiDir, radius * inscribedDot);
+    const _cn=hemiDir.clone(), _cr2=inscribedR*inscribedR;
+    const _memCr2 = _cr2 * MEMBRANE_MASK_SCALE * MEMBRANE_MASK_SCALE;
+    const self=this;
+    this.membraneMat.onBeforeCompile = shader => {
+      shader.uniforms.uCircCenter={value:_cc};
+      shader.uniforms.uCircNormal={value:_cn};
+      shader.uniforms.uCircR2   ={value:_memCr2};
+      self._memUniforms = shader.uniforms;
+      shader.vertexShader = 'varying vec3 vWP;\n'+
+        shader.vertexShader.replace(
+          '#include <begin_vertex>',
+          '#include <begin_vertex>\ntransformed -= normal * 0.002;\nvWP=(modelMatrix*vec4(transformed,1.0)).xyz;'
+        );
+      shader.fragmentShader = 'varying vec3 vWP;\nuniform vec3 uCircCenter;\nuniform vec3 uCircNormal;\nuniform float uCircR2;\n'+
+        shader.fragmentShader.replace('#include <clipping_planes_fragment>',
+        `#include <clipping_planes_fragment>
+        { vec3 d=vWP-uCircCenter;float r2=dot(d,d)-pow(dot(d,uCircNormal),2.0);
+          float trans=uCircR2*0.06;float edgeAlpha=1.0-smoothstep(-trans,trans,r2-uCircR2);
+          if(edgeAlpha<0.01)discard;gl_FragColor.a=edgeAlpha; }`);
+    };
+    this.membraneMat.needsUpdate = true;
+
+    // Sphere shader (discard interior cap)
+    const _sc=centroid.clone(), _sn=hemiDir.clone();
+    this.sphereBackMat.onBeforeCompile = shader => {
+      shader.uniforms.uCircCenter={value:_sc};
+      shader.uniforms.uCircNormal={value:_sn};
+      shader.uniforms.uCircR2    ={value:inscribedR*inscribedR};
+      self._sphUniforms = shader.uniforms;
+      shader.vertexShader = 'varying vec3 vSphWP;\n'+
+        shader.vertexShader.replace('#include <begin_vertex>','#include <begin_vertex>\nvSphWP=(modelMatrix*vec4(position,1.0)).xyz;');
+        shader.fragmentShader = 'varying vec3 vSphWP;\nuniform vec3 uCircCenter;\nuniform vec3 uCircNormal;\nuniform float uCircR2;\n'+
+        shader.fragmentShader.replace('#include <clipping_planes_fragment>',
+        `#include <clipping_planes_fragment>
+        { vec3 d=vSphWP-uCircCenter;float r2=dot(d,d)-pow(dot(d,uCircNormal),2.0);
+          if(${isDotSource ? 'false' : 'r2<uCircR2*0.50'})discard; }`);
+    };
+    this.sphereBackMat.needsUpdate = true;
+
+    // Hidden placeholder mesh; visible display geometry is rebuilt from the aligned assembly sphere.
+    const sphGeo = new THREE.SphereGeometry(radius, 256, 256);
+    this.sphereBackObj = new THREE.Mesh(sphGeo, this.sphereBackMat);
+    this.sphereBackObj.position.copy(fit.center).addScaledVector(hemiDir, -radius * ASSEMBLY_BACKOFF);
+    this.sphereBackObj.renderOrder = -1;
+    this.sphereBackObj.visible = false;
+    this.scene.add(this.sphereBackObj);
+    this.sphereBackBasePosition = this.sphereBackObj.position.clone();
+
+    // Precompute mesh-vertex directions for sphere deformation
+    this.sphereVerts0   = this.sphereBackObj.geometry.attributes.position.array.slice();
+    this.mDir0 = new Float32Array(nv*3);
+    for(let j=0;j<nv;j++){
+      const mx=verts[j*3]-fit.center.x, my=verts[j*3+1]-fit.center.y, mz=verts[j*3+2]-fit.center.z;
+      const ml=Math.sqrt(mx*mx+my*my+mz*mz);
+      if(ml>1e-6){this.mDir0[j*3]=mx/ml; this.mDir0[j*3+1]=my/ml; this.mDir0[j*3+2]=mz/ml;}
+    }
+    this.mBins = Array.from({length:M_BIN*M_BIN},()=>[]);
+    for(let j=0;j<nv;j++){
+      const pb=Math.min((((Math.atan2(this.mDir0[j*3+2],this.mDir0[j*3])+Math.PI)/(2*Math.PI)*M_BIN)|0),M_BIN-1);
+      const tb=Math.min((((this.mDir0[j*3+1]+1)*0.5*M_BIN)|0),M_BIN-1);
+      this.mBins[pb*M_BIN+tb].push(j);
+    }
+    this.sphereFitCenter    = fit.center.clone();
+    this.sphereHemiDir      = hemiDir.clone();
+    this.sphereInscribedDot = inscribedDot;
+    this.sphereRadius       = radius;
+    this.sphereTU           = tU.clone();
+    this.sphereTV           = tV.clone();
+    const centerPatchR2 = (inscribedR * CENTER_PATCH_RADIUS_RATIO) ** 2;
+    this.centerPatchIndices = [];
+    this.centerPatchR0 = [];
+    for (let i = 0; i < nv; i++) {
+      const dx=verts[i*3]-centroid.x, dy=verts[i*3+1]-centroid.y, dz=verts[i*3+2]-centroid.z;
+      const u=dx*tU.x+dy*tU.y+dz*tU.z, v=dx*tV.x+dy*tV.y+dz*tV.z;
+      if (u*u + v*v > centerPatchR2) continue;
+      const rx = verts[i*3] - fit.center.x;
+      const ry = verts[i*3+1] - fit.center.y;
+      const rz = verts[i*3+2] - fit.center.z;
+      this.centerPatchIndices.push(i);
+      this.centerPatchR0.push(Math.sqrt(rx*rx + ry*ry + rz*rz));
+    }
+
+    this.positionCamera(geo.boundingSphere);
+    this.recenterView();
+    if (gltfAssemblyScene)  this.addAssembly(gltfAssemblyScene);
+    if (gltfAssembly1Scene) this.addAssembly1(gltfAssembly1Scene);
+  }
+
+  rebuildDisplaySphereFromAssembly() {
+    if (!this.assemblyObj || !this.sphereBackObj) return;
+    this.assemblyObj.updateMatrixWorld(true);
+    const geos = [];
+    this.assemblyObj.traverse(obj => {
+      if (!isAssemblySphereMesh(obj) || !obj.geometry) return;
+      const g = obj.geometry.clone();
+      g.applyMatrix4(obj.matrixWorld);
+      g.deleteAttribute('normal');
+      g.deleteAttribute('uv');
+      geos.push(g);
+    });
+    if (!geos.length) return;
+    const merged = BufferGeometryUtils.mergeGeometries(geos, false);
+    merged.computeVertexNormals();
+    this.sphereBackObj.geometry.dispose();
+    this.sphereBackObj.geometry = merged;
+    this.sphereBackObj.position.set(0, 0, 0);
+    this.sphereBackObj.visible = true;
+    this.sphereVerts0 = merged.attributes.position.array.slice();
+  }
+
+  buildGuideLine(points, color) {
+    const geo = new THREE.BufferGeometry().setFromPoints(points);
+    const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
+      color, transparent:true, opacity:0.95, depthTest:false, depthWrite:false,
+    }));
+    line.renderOrder = 10;
+    return line;
+  }
+
+  getDisplaySphereCenter() {
+    if (!this.sphereFitCenter || !this.sphereHemiDir || !this.sphereRadius) return null;
+    return this.sphereFitCenter
+      .clone()
+      .addScaledVector(this.sphereHemiDir, -this.sphereRadius * ASSEMBLY_BACKOFF);
+  }
+
+  getCylinderAxisFromFace(mesh) {
+    if (!mesh?.isMesh || !mesh.geometry?.attributes?.position) return null;
+
+    const pos = mesh.geometry.attributes.position;
+    const mins = [Infinity, Infinity, Infinity];
+    const maxs = [-Infinity, -Infinity, -Infinity];
+    const p = new THREE.Vector3();
+
+    for (let i = 0; i < pos.count; i++) {
+      p.fromBufferAttribute(pos, i);
+      if (p.x < mins[0]) mins[0] = p.x;
+      if (p.y < mins[1]) mins[1] = p.y;
+      if (p.z < mins[2]) mins[2] = p.z;
+      if (p.x > maxs[0]) maxs[0] = p.x;
+      if (p.y > maxs[1]) maxs[1] = p.y;
+      if (p.z > maxs[2]) maxs[2] = p.z;
+    }
+
+    let best = null;
+    const axes = ['x', 'y', 'z'];
+    for (let axis = 0; axis < 3; axis++) {
+      const span = maxs[axis] - mins[axis];
+      if (span <= 1e-9) continue;
+      const tol = Math.max(span * 0.02, 1e-5);
+
+      for (const side of ['min', 'max']) {
+        const extreme = side === 'min' ? mins[axis] : maxs[axis];
+        let count = 0;
+        let sumA = 0, sumB = 0;
+        let minA = Infinity, minB = Infinity;
+        let maxA = -Infinity, maxB = -Infinity;
+
+        for (let i = 0; i < pos.count; i++) {
+          p.fromBufferAttribute(pos, i);
+          const axisValue = axis === 0 ? p.x : axis === 1 ? p.y : p.z;
+          if (Math.abs(axisValue - extreme) > tol) continue;
+
+          const a = axis === 0 ? p.y : p.x;
+          const b = axis === 2 ? p.y : p.z;
+          sumA += a;
+          sumB += b;
+          if (a < minA) minA = a;
+          if (a > maxA) maxA = a;
+          if (b < minB) minB = b;
+          if (b > maxB) maxB = b;
+          count++;
+        }
+
+        if (count < 12) continue;
+
+        const spanA = Math.max(maxA - minA, 1e-9);
+        const spanB = Math.max(maxB - minB, 1e-9);
+        const isotropy = Math.min(spanA, spanB) / Math.max(spanA, spanB);
+        const area = spanA * spanB;
+        const score = isotropy - area * 5;
+
+        if (!best || score > best.score) {
+          const center = new THREE.Vector3();
+          center[axes[axis]] = extreme;
+          if (axis === 0) {
+            center.y = sumA / count;
+            center.z = sumB / count;
+          } else if (axis === 1) {
+            center.x = sumA / count;
+            center.z = sumB / count;
+          } else {
+            center.x = sumA / count;
+            center.y = sumB / count;
+          }
+
+          const dir = new THREE.Vector3(
+            axis === 0 ? 1 : 0,
+            axis === 1 ? 1 : 0,
+            axis === 2 ? 1 : 0,
+          );
+
+          best = { center, dir, score };
+        }
+      }
+    }
+
+    if (!best) return null;
+    return {
+      center: mesh.localToWorld(best.center),
+      dir: best.dir.transformDirection(mesh.matrixWorld).normalize(),
+    };
+  }
+
+  getCylinderAxisWorld(root) {
+    if (!root) return null;
+
+    let best = null;
+    let bestObj = null;
+    root.traverse(obj => {
+      if (!obj?.isMesh || !obj.geometry) return;
+      const pos = obj.geometry.attributes.position;
+      if (!pos) return;
+
+      // Compute bbox from vertices — Draco-compressed geometries have stale
+      // geom.boundingBox set to the quantization range [-1,1], not real coords.
+      let mnX=Infinity,mnY=Infinity,mnZ=Infinity,mxX=-Infinity,mxY=-Infinity,mxZ=-Infinity;
+      const _v = new THREE.Vector3();
+      for (let i = 0; i < pos.count; i++) {
+        _v.fromBufferAttribute(pos, i);
+        if (_v.x<mnX)mnX=_v.x; if (_v.x>mxX)mxX=_v.x;
+        if (_v.y<mnY)mnY=_v.y; if (_v.y>mxY)mxY=_v.y;
+        if (_v.z<mnZ)mnZ=_v.z; if (_v.z>mxZ)mxZ=_v.z;
+      }
+
+      const dims = [mxX-mnX, mxY-mnY, mxZ-mnZ];
+      const indexed = dims.map((value, axis) => ({ value, axis })).sort((a, b) => b.value - a.value);
+      const longest = indexed[0].value;
+      const mid = indexed[1].value;
+      const shortest = indexed[2].value;
+      if (shortest <= 1e-9 || longest <= 1e-9) return;
+
+      const localCenter = new THREE.Vector3(
+        (mnX+mxX)*0.5, (mnY+mxY)*0.5, (mnZ+mxZ)*0.5
+      );
+
+      const roundness = 1 - Math.abs(mid - shortest) / Math.max(mid, shortest);
+      const slenderness = longest / Math.max(mid, shortest);
+      if (roundness < 0.75 || slenderness < 1.2) return;
+
+      const score = roundness * 10 + Math.min(slenderness, 6);
+      if (best && score <= best.score) return;
+
+      const localDir = new THREE.Vector3(
+        indexed[0].axis === 0 ? 1 : 0,
+        indexed[0].axis === 1 ? 1 : 0,
+        indexed[0].axis === 2 ? 1 : 0,
+      );
+      best = {
+        center: obj.localToWorld(localCenter),
+        dir: localDir.transformDirection(obj.matrixWorld).normalize(),
+        halfLength: longest * 0.5,
+        score,
+      };
+      bestObj = obj;
+    });
+
+    const seed = best ? {
+      center: best.center.clone(),
+      dir: best.dir.clone(),
+      halfLength: best.halfLength,
+      score: best.score,
+    } : null;
+
+    if (seed) {
+      const dir = seed.dir.clone().normalize();
+      const guide = Math.abs(dir.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+      const basisU = new THREE.Vector3().crossVectors(dir, guide).normalize();
+      const basisV = new THREE.Vector3().crossVectors(dir, basisU).normalize();
+      const verts = [];
+      const p = new THREE.Vector3();
+      let minT = Infinity;
+      let maxT = -Infinity;
+
+      bestObj?.updateMatrixWorld(true);
+      const pos = bestObj?.geometry?.attributes?.position;
+      if (pos) {
+        for (let i = 0; i < pos.count; i++) {
+          p.fromBufferAttribute(pos, i).applyMatrix4(bestObj.matrixWorld);
+          const t = p.dot(dir);
+          const u = p.dot(basisU);
+          const v = p.dot(basisV);
+          verts.push({ point: p.clone(), t, u, v });
+          if (t < minT) minT = t;
+          if (t > maxT) maxT = t;
+        }
+      }
+
+      if (verts.length) {
+        const spanT = Math.max(maxT - minT, 1e-6);
+        const tol = Math.max(spanT * 0.01, 1e-5);
+        const bins = new Map();
+        for (const vert of verts) {
+          const key = Math.round(vert.t / tol);
+          let bin = bins.get(key);
+          if (!bin) {
+            bin = {
+              count: 0, sum: new THREE.Vector3(), minU: Infinity, maxU: -Infinity, minV: Infinity, maxV: -Infinity, t: 0,
+            };
+            bins.set(key, bin);
+          }
+          bin.count++;
+          bin.sum.add(vert.point);
+          bin.t += vert.t;
+          if (vert.u < bin.minU) bin.minU = vert.u;
+          if (vert.u > bin.maxU) bin.maxU = vert.u;
+          if (vert.v < bin.minV) bin.minV = vert.v;
+          if (vert.v > bin.maxV) bin.maxV = vert.v;
+        }
+
+        let maxArea = 0;
+        const slices = [];
+        for (const bin of bins.values()) {
+          if (bin.count < 12) continue;
+          const spanU = bin.maxU - bin.minU;
+          const spanV = bin.maxV - bin.minV;
+          const area = spanU * spanV;
+          if (area <= 1e-9) continue;
+          const isotropy = Math.min(spanU, spanV) / Math.max(spanU, spanV);
+          const centerU = (bin.minU + bin.maxU) * 0.5;
+          const centerV = (bin.minV + bin.maxV) * 0.5;
+          const center = dir.clone().multiplyScalar(bin.t / bin.count)
+            .addScaledVector(basisU, centerU)
+            .addScaledVector(basisV, centerV);
+          const slice = { area, isotropy, center, t: bin.t / bin.count, spanU, spanV };
+          slices.push(slice);
+          if (area > maxArea) maxArea = area;
+        }
+
+        if (slices.length) {
+          const cylinderCandidates = slices
+            .filter(slice => slice.isotropy > 0.9 && slice.area < maxArea * 0.75 && slice.area > maxArea * 0.08);
+          const cylinderFace = cylinderCandidates
+            .slice()
+            .sort((a, b) => b.area - a.area)[0];
+          const plateFace = cylinderFace
+            ? slices
+                .filter(slice => slice.area >= maxArea * 0.85)
+                .sort((a, b) => Math.abs(a.t - cylinderFace.t) - Math.abs(b.t - cylinderFace.t))[0]
+            : null;
+
+          if (cylinderFace && plateFace) {
+            const signedLength = cylinderFace.t - plateFace.t;
+            const nominalDir = signedLength >= 0 ? dir.clone() : dir.clone().multiplyScalar(-1);
+            const tipFace = cylinderCandidates
+              .slice()
+              .sort((a, b) => nominalDir.dot(dir) >= 0 ? b.t - a.t : a.t - b.t)[0] || cylinderFace;
+            const tMin = Math.min(cylinderFace.t, plateFace.t);
+            const tMax = Math.max(cylinderFace.t, plateFace.t);
+            const lengthAbs = Math.abs(signedLength);
+            const cylinderSlices = slices.filter(slice =>
+              slice.isotropy > 0.82 &&
+              slice.area >= cylinderFace.area * 0.75 &&
+              slice.area <= cylinderFace.area * 1.25 &&
+              slice.t >= tMin + lengthAbs * 0.15 &&
+              slice.t <= tMax - lengthAbs * 0.15
+            );
+
+            let center = tipFace.center.clone();
+            let axisDir = nominalDir.clone();
+            if (cylinderSlices.length >= 2) {
+              const first = cylinderSlices[0].center;
+              const last = cylinderSlices[cylinderSlices.length - 1].center;
+              const fittedDir = new THREE.Vector3().subVectors(last, first);
+              if (fittedDir.lengthSq() > 1e-12) {
+                fittedDir.normalize();
+                if (fittedDir.dot(nominalDir) < 0) fittedDir.multiplyScalar(-1);
+                axisDir = fittedDir;
+              }
+              center = new THREE.Vector3();
+              for (const slice of cylinderSlices) center.add(slice.center);
+              center.multiplyScalar(1 / cylinderSlices.length);
+            } else {
+              const centerT = (tipFace.t + plateFace.t) * 0.5;
+              const radialOffset = center.dot(axisDir);
+              center.addScaledVector(axisDir, centerT - radialOffset);
+            }
+
+            return {
+              center: center.clone(),
+              dir: axisDir,
+              halfLength: Math.max(lengthAbs * 0.5, seed.halfLength || 0),
+            };
+          }
+        }
+      }
+    }
+
+    if (best) return best;
+
+    let fallback = null;
+    root.traverse(obj => {
+      if (fallback || !obj?.isMesh) return;
+      fallback = this.getCylinderAxisFromFace(obj);
+    });
+    return fallback;
+  }
+
+  rebuildAssembly1Guides(anchorCenter, sphereCenter, axisDir, cylinderHalfHint = null) {
+    if (this.assembly1GuideObj) this.scene.remove(this.assembly1GuideObj);
+
+    const dir = axisDir.clone().normalize();
+    const group = new THREE.Group();
+    const centerGap = anchorCenter.distanceTo(sphereCenter);
+    const cylinderHalfBase = cylinderHalfHint ?? Math.max(this.sphereRadius * 0.45, centerGap * 0.16);
+    const cylinderHalf = cylinderHalfBase * 3;
+    const sphereHalf = Math.max(this.sphereRadius * 1.3, centerGap * 0.2);
+    let sphereDir = new THREE.Vector3().copy(this.sphereHemiDir || this.sphereTV || this.sphereTU || new THREE.Vector3(0, 0, 1));
+    if (sphereDir.lengthSq() < 1e-12) {
+      sphereDir = new THREE.Vector3().copy(this.sphereTV || this.sphereTU || new THREE.Vector3(0, 1, 0));
+    }
+    sphereDir.normalize();
+
+    const cylinderLine = this.buildGuideLine([
+      anchorCenter.clone().addScaledVector(dir, -cylinderHalf),
+      anchorCenter.clone().addScaledVector(dir,  cylinderHalf),
+    ], 0xff5a36);
+
+    const sphereLine = this.buildGuideLine([
+      sphereCenter.clone().addScaledVector(sphereDir, -sphereHalf),
+      sphereCenter.clone().addScaledVector(sphereDir,  sphereHalf),
+    ], 0x22b8ff);
+
+    group.add(cylinderLine, sphereLine);
+    this.assembly1GuideObj = group;
+    this.scene.add(group);
+  }
+
+  addAssembly(assemblyScene) {
+    if (!assemblySphereCenter || !assemblySphereRadius || !assemblySphereHemiDir || !assemblySphereTU || !assemblySphereTV) return;
+    if (!this.sphereFitCenter || !this.sphereRadius || !this.sphereHemiDir) return;
+    if (this.assemblyObj) this.scene.remove(this.assemblyObj);
+
+    this.assemblyObj = assemblyScene.clone(true);
+
+    const s = this.sphereRadius / assemblySphereRadius;
+    const srcBasis = new THREE.Matrix4().makeBasis(
+      assemblySphereTU.clone(),
+      assemblySphereTV.clone(),
+      assemblySphereHemiDir.clone()
+    );
+    const dstBasis = new THREE.Matrix4().makeBasis(
+      this.sphereTU.clone(),
+      this.sphereTV.clone(),
+      this.sphereHemiDir.clone()
+    );
+    const rot = new THREE.Matrix4().copy(dstBasis).multiply(new THREE.Matrix4().copy(srcBasis).invert());
+    const q = new THREE.Quaternion().setFromRotationMatrix(rot);
+    const finalQ = q.clone();
+    if (ASSEMBLY_FLIP) {
+      const flipQ = new THREE.Quaternion().setFromAxisAngle(this.sphereHemiDir.clone().normalize(), Math.PI);
+      finalQ.premultiply(flipQ);
+    }
+    const rotatedCenter = assemblySphereCenter.clone().multiplyScalar(s).applyQuaternion(finalQ);
+    const targetCenter = this.sphereFitCenter;
+
+    this.assemblyObj.scale.setScalar(s);
+    this.assemblyObj.quaternion.copy(finalQ);
+    this.assemblyObj.position.copy(targetCenter).sub(rotatedCenter);
+    this.assemblyObj.position.addScaledVector(this.sphereHemiDir, -this.sphereRadius * ASSEMBLY_BACKOFF);
+    this.assemblyObj.traverse(obj => { if (isAssemblySphereMesh(obj)) obj.visible = false; });
+    this.scene.add(this.assemblyObj);
+    this.rebuildDisplaySphereFromAssembly();
+    this.sphereBackBasePosition = this.sphereBackObj ? this.sphereBackObj.position.clone() : null;
+    this.assemblyBasePosition = this.assemblyObj.position.clone();
+    this.recenterView();
+  }
+
+  addAssembly1(assembly1Scene) {
+    if (!this.sphereFitCenter || !this.sphereRadius || !this.sphereTU) return;
+    if (this.assembly1Obj) this.scene.remove(this.assembly1Obj);
+
+    this.assembly1Obj = assembly1Scene.clone(true);
+    // Both GLTFs are in meters (Onshape export) — same scale factor as addAssembly
+    const s = (assemblySphereRadius > 1e-6) ? this.sphereRadius / assemblySphereRadius : 1;
+    this.assembly1Scale = s;
+
+    this.assembly1Obj.scale.setScalar(s);
+
+    const displaySphereCenter = this.getDisplaySphereCenter();
+    if (!displaySphereCenter) return;
+
+    // Step 1: place at origin to compute cylinder axis center in world space
+    this.assembly1Obj.position.set(0, 0, 0);
+    this.scene.add(this.assembly1Obj);
+    this.assembly1Obj.updateMatrixWorld(true);
+
+    const anchorObj = findFirstNamedObject(this.assembly1Obj, ACTIVE_SIZE.cylinderAnchorNames) || this.assembly1Obj;
+    const placementObj = findFirstNamedObject(this.assembly1Obj, ACTIVE_SIZE.placementAnchorNames) || anchorObj;
+    const axis = this.getCylinderAxisWorld(anchorObj);
+    const localPlacementBox = placementObj.geometry?.boundingBox
+      ? placementObj.geometry.boundingBox.clone()
+      : (() => {
+          placementObj.geometry?.computeBoundingBox();
+          return placementObj.geometry?.boundingBox?.clone() || null;
+        })();
+    const placementCenterLocal = localPlacementBox
+      ? localPlacementBox.getCenter(new THREE.Vector3())
+      : placementObj.worldToLocal(new THREE.Box3().setFromObject(placementObj).getCenter(new THREE.Vector3()));
+    const plateCenterAtOrigin = placementObj.localToWorld(placementCenterLocal.clone());
+
+    // Step 2: rotate and translate the whole Assembly 1 so its orange guide
+    // line becomes collinear with the blue guide line, without moving the line
+    // relative to Assembly 1 itself.
+    const axisDir = axis?.dir?.clone().normalize() || this.sphereTU.clone().normalize();
+    let sphereDir = new THREE.Vector3().copy(this.sphereHemiDir || this.sphereTV || this.sphereTU || new THREE.Vector3(0, 0, 1));
+    if (sphereDir.lengthSq() < 1e-12) {
+      sphereDir = new THREE.Vector3().copy(this.sphereTV || this.sphereTU || new THREE.Vector3(0, 1, 0));
+    }
+    sphereDir.normalize();
+    const alignQ = new THREE.Quaternion().setFromUnitVectors(axisDir, sphereDir);
+    this.assembly1Obj.quaternion.premultiply(alignQ);
+    if (ASSEMBLY1_FLIP) {
+      let flipAxis = new THREE.Vector3().copy(this.sphereTV || this.sphereTU || new THREE.Vector3(0, 1, 0));
+      if (flipAxis.lengthSq() < 1e-12) flipAxis = new THREE.Vector3(0, 1, 0);
+      flipAxis.normalize();
+      const flipQ = new THREE.Quaternion().setFromAxisAngle(flipAxis, Math.PI);
+      this.assembly1Obj.quaternion.premultiply(flipQ);
+    }
+    const rotatedPlateCenter = plateCenterAtOrigin.clone().applyQuaternion(this.assembly1Obj.quaternion);
+    const targetPlateCenter = displaySphereCenter.clone()
+      .addScaledVector(sphereDir, -ACTIVE_SIZE.assembly1Backoff)
+      .add(new THREE.Vector3(
+        ASSEMBLY1_ALIGN_OFFSET_X,
+        ASSEMBLY1_ALIGN_OFFSET_Y,
+        0,
+      ));
+    this.assembly1Obj.position.copy(targetPlateCenter).sub(rotatedPlateCenter);
+    this.assembly1Obj.updateMatrixWorld(true);
+
+    const placedAxis = { center: targetPlateCenter.clone(), dir: sphereDir.clone(), halfLength: axis?.halfLength ?? null };
+    this.assemblyMotionDir = new THREE.Vector3().subVectors(targetPlateCenter, displaySphereCenter).normalize();
+    this.rebuildAssembly1Guides(
+      placedAxis.center,
+      displaySphereCenter.clone(),
+      placedAxis.dir,
+      placedAxis.halfLength ? placedAxis.halfLength * 0.65 : null,
+    );
+
+    this.recenterView();
+  }
+
+  setFrame(f, displaySeconds = 0) {
+    if(!this.membraneObj||!this.meshData) return;
+    const frames = this.meshData.frames;
+    if(!frames || frames.length === 0) return;
+    const flat = frames[Math.min(f, frames.length-1)];
+    if(!flat) return;
+
+    const posArr = this.membraneObj.geo.attributes.position.array;
+    posArr.set(flat);
+    this.membraneObj.geo.attributes.position.needsUpdate = true;
+    this.membraneObj.geo.computeVertexNormals();
+
+    if(this.sphereTU && this._memUniforms){
+      const nv=flat.length/3;
+      let fcx=0,fcy=0,fcz=0;
+      for(let i=0;i<nv;i++){fcx+=flat[i*3];fcy+=flat[i*3+1];fcz+=flat[i*3+2];}
+      fcx/=nv;fcy/=nv;fcz/=nv;
+      const tux=this.sphereTU.x,tuy=this.sphereTU.y,tuz=this.sphereTU.z;
+      const tvx=this.sphereTV.x,tvy=this.sphereTV.y,tvz=this.sphereTV.z;
+      let minU=Infinity,maxU=-Infinity,minV=Infinity,maxV=-Infinity;
+      for(let i=0;i<nv;i++){
+        const ddx=flat[i*3]-fcx,ddy=flat[i*3+1]-fcy,ddz=flat[i*3+2]-fcz;
+        const u=ddx*tux+ddy*tuy+ddz*tuz, v=ddx*tvx+ddy*tvy+ddz*tvz;
+        if(u<minU)minU=u;if(u>maxU)maxU=u;if(v<minV)minV=v;if(v>maxV)maxV=v;
+      }
+      const newR=Math.min((maxU-minU)/2,(maxV-minV)/2)*this.circleScale;
+      const newDot = Math.sqrt(Math.max(0, 1-(newR/this.sphereRadius)**2));
+      this._memUniforms.uCircR2.value = newR * newR * MEMBRANE_MASK_SCALE * MEMBRANE_MASK_SCALE;
+      if(this._sphUniforms) this._sphUniforms.uCircR2.value = newR * newR;
+      this.sphereInscribedDot = newDot;
+      this._frameCircCenter = this.sphereFitCenter
+        .clone()
+        .addScaledVector(this.sphereHemiDir, this.sphereRadius * newDot);
+    }
+
+
+    if(!this.sphereBackObj||!this.sphereVerts0||!this.mDir0) return;
+    const flat0 = this.meshData.frames[0];
+    const nMesh=this.mDir0.length/3;
+    const pos =this.sphereBackObj.geometry.attributes.position.array;
+    const nSph=this.sphereVerts0.length/3;
+    const ccx=this.sphereFitCenter.x, ccy=this.sphereFitCenter.y, ccz=this.sphereFitCenter.z;
+    const hdx=this.sphereHemiDir.x, hdy=this.sphereHemiDir.y, hdz=this.sphereHemiDir.z;
+    const capThresh=this.sphereInscribedDot-0.02;
+    const edge0=capThresh-0.14, edge1=capThresh+0.06;
+
+    const tDot=new Float32Array(4), tIdx=new Int32Array(4);
+
+    for(let i=0;i<nSph;i++){
+      const vx=this.sphereVerts0[i*3], vy=this.sphereVerts0[i*3+1], vz=this.sphereVerts0[i*3+2];
+      const lvx=vx-ccx, lvy=vy-ccy, lvz=vz-ccz;
+      const len=Math.sqrt(lvx*lvx+lvy*lvy+lvz*lvz);
+      if(len<1e-6){pos[i*3]=vx;pos[i*3+1]=vy;pos[i*3+2]=vz;continue;}
+      const hDot=(lvx*hdx+lvy*hdy+lvz*hdz)/len;
+      if(hDot<edge0){pos[i*3]=vx;pos[i*3+1]=vy;pos[i*3+2]=vz;continue;}
+      const nx=lvx/len, ny=lvy/len, nz=lvz/len;
+
+      const pb=Math.min((((Math.atan2(nz,nx)+Math.PI)/(2*Math.PI)*M_BIN)|0),M_BIN-1);
+      const tb=Math.min((((ny+1)*0.5*M_BIN)|0),M_BIN-1);
+
+      tDot[0]=tDot[1]=tDot[2]=tDot[3]=-Infinity;
+      for(let dp=-1;dp<=1;dp++){
+        const pbi=((pb+dp)+M_BIN)%M_BIN;
+        for(let dt=-1;dt<=1;dt++){
+          const tbi=tb+dt; if(tbi<0||tbi>=M_BIN) continue;
+          const bin=this.mBins[pbi*M_BIN+tbi];
+          for(let bi=0;bi<bin.length;bi++){
+            const j=bin[bi];
+            const d=nx*this.mDir0[j*3]+ny*this.mDir0[j*3+1]+nz*this.mDir0[j*3+2];
+            if(d>tDot[3]){tDot[3]=d;tIdx[3]=j;
+              if(tDot[3]>tDot[2]){let t;t=tDot[2];tDot[2]=tDot[3];tDot[3]=t;t=tIdx[2];tIdx[2]=tIdx[3];tIdx[3]=t;}
+              if(tDot[2]>tDot[1]){let t;t=tDot[1];tDot[1]=tDot[2];tDot[2]=t;t=tIdx[1];tIdx[1]=tIdx[2];tIdx[2]=t;}
+              if(tDot[1]>tDot[0]){let t;t=tDot[0];tDot[0]=tDot[1];tDot[1]=t;t=tIdx[0];tIdx[0]=tIdx[1];tIdx[1]=t;}
+            }
+          }
+        }
+      }
+      if(tDot[0]===-Infinity){
+        for(let j=0;j<nMesh;j++){
+          const d=nx*this.mDir0[j*3]+ny*this.mDir0[j*3+1]+nz*this.mDir0[j*3+2];
+          if(d>tDot[3]){tDot[3]=d;tIdx[3]=j;
+            if(tDot[3]>tDot[2]){let t;t=tDot[2];tDot[2]=tDot[3];tDot[3]=t;t=tIdx[2];tIdx[2]=tIdx[3];tIdx[3]=t;}
+            if(tDot[2]>tDot[1]){let t;t=tDot[1];tDot[1]=tDot[2];tDot[2]=t;t=tIdx[1];tIdx[1]=tIdx[2];tIdx[2]=t;}
+            if(tDot[1]>tDot[0]){let t;t=tDot[0];tDot[0]=tDot[1];tDot[1]=t;t=tIdx[0];tIdx[0]=tIdx[1];tIdx[1]=t;}
+          }
+        }
+      }
+
+      let wSum=0,wdx=0,wdy=0,wdz=0;
+      for(let k=0;k<4;k++){
+        if(tDot[k]<0.8) break;
+        const w=Math.pow(tDot[k],8), j=tIdx[k];
+        wdx+=w*(flat[j*3]  -flat0[j*3]);
+        wdy+=w*(flat[j*3+1]-flat0[j*3+1]);
+        wdz+=w*(flat[j*3+2]-flat0[j*3+2]);
+        wSum+=w;
+      }
+      if(wSum<1e-8){pos[i*3]=vx;pos[i*3+1]=vy;pos[i*3+2]=vz;continue;}
+      const inward = 1 - ASSEMBLY_INWARD_BIAS;
+      const dx=(wdx/wSum)*inward, dy=(wdy/wSum)*inward, dz=(wdz/wSum)*inward;
+      const tx=vx+dx, ty=vy+dy, tz=vz+dz;
+
+      if(hDot>edge1){pos[i*3]=tx;pos[i*3+1]=ty;pos[i*3+2]=tz;continue;}
+
+      const xb=(hDot-edge0)/(edge1-edge0);
+      let blend=xb*xb*(3-2*xb);
+      blend*=THREE.MathUtils.clamp((tDot[0]-0.9)/0.1,0,1);
+      pos[i*3]  =vx+(tx-vx)*blend;
+      pos[i*3+1]=vy+(ty-vy)*blend;
+      pos[i*3+2]=vz+(tz-vz)*blend;
+    }
+    this.sphereBackObj.geometry.attributes.position.needsUpdate=true;
+    this.sphereBackObj.geometry.computeVertexNormals();
+    this.sphereBackObj.geometry.normalizeNormals();
+
+    if (this.assemblyObj && this.centerPatchIndices?.length && this.assemblyMotionDir) {
+      let inwardSum = 0;
+      for (let k = 0; k < this.centerPatchIndices.length; k++) {
+        const i = this.centerPatchIndices[k];
+        const x = flat[i*3], y = flat[i*3+1], z = flat[i*3+2];
+        const rx = x - this.sphereFitCenter.x;
+        const ry = y - this.sphereFitCenter.y;
+        const rz = z - this.sphereFitCenter.z;
+        const rt = Math.sqrt(rx*rx + ry*ry + rz*rz);
+        inwardSum += Math.max(0, this.centerPatchR0[k] - rt);
+      }
+      const centerInward = inwardSum / this.centerPatchIndices.length;
+      if (this.membraneObj?.mesh && this.membraneBasePosition) {
+        this.membraneObj.mesh.position.copy(this.membraneBasePosition).addScaledVector(this.assemblyMotionDir, centerInward);
+      }
+      if (this.sphereBackObj && this.sphereBackBasePosition) {
+        this.sphereBackObj.position.copy(this.sphereBackBasePosition).addScaledVector(this.assemblyMotionDir, centerInward);
+      }
+      if (this.assemblyBasePosition) {
+        this.assemblyObj.position.copy(this.assemblyBasePosition).addScaledVector(this.assemblyMotionDir, centerInward);
+      }
+    }
+
+    if (this._frameCircCenter && this._memUniforms?.uCircCenter) {
+      this._memUniforms.uCircCenter.value
+        .copy(this._frameCircCenter)
+        .add(this.membraneObj?.mesh?.position || new THREE.Vector3());
+    }
+    if (this._frameCircCenter && this._sphUniforms?.uCircCenter) {
+      this._sphUniforms.uCircCenter.value
+        .copy(this._frameCircCenter)
+        .add(this.sphereBackObj?.position || new THREE.Vector3());
+    }
+  }
+
+  positionCamera(bSphere) {
+    const c=bSphere?bSphere.center:new THREE.Vector3(0,0,0);
+    const r=bSphere?bSphere.radius:1;
+    this.camera.position.set(c.x, c.y+r*0.1, c.z+r*13.0);
+    this.camera.near=r*0.01; this.camera.far=r*500;
+    this.camera.updateProjectionMatrix();
+    this.controls.target.copy(c);
+    this.controls.update();
+  }
+
+  recenterView() {
+    const box = new THREE.Box3();
+    let hasObject = false;
+    [this.membraneObj?.mesh, this.sphereBackObj, this.assemblyObj, this.assembly1Obj, this.assembly1GuideObj].forEach(obj => {
+      if (!obj) return;
+      box.expandByObject(obj);
+      hasObject = true;
+    });
+    if (!hasObject || box.isEmpty()) return;
+    const nextTarget = box.getCenter(new THREE.Vector3());
+    const delta = new THREE.Vector3().subVectors(nextTarget, this.controls.target);
+    this.controls.target.copy(nextTarget);
+    this.camera.position.add(delta);
+    this.controls.update();
+  }
+
+  resize() {
+    const W=this.wrap.clientWidth, H=this.wrap.clientHeight;
+    this.renderer.setSize(W, H);
+    this.camera.aspect = W/H;
+    this.camera.clearViewOffset();
+    this.camera.updateProjectionMatrix();
+  }
+
+  tick() {
+    this.controls.update();
+    this.renderer.render(this.scene, this.camera);
+  }
+}
+
+// ── Instantiate panels ────────────────────────────────────────────────────────
+const leftPanel  = new Panel(document.getElementById('left-canvas'),  document.getElementById('left-wrap'),  0x6af6b5);
+const rightPanel = new Panel(document.getElementById('right-canvas'), document.getElementById('right-wrap'), 0x6af6b5);
+
+// ── Playback ──────────────────────────────────────────────────────────────────
+let playing=false, currentFrame=0, playT0=0, playF0=0, fps=30, maxFrames=0;
+let motionProfile = null;
+const slider    = document.getElementById('slider');
+const frameInfo = document.getElementById('frame-info');
+const btnPlay   = document.getElementById('btnPlay');
+const btnSize20 = document.getElementById('btnSize20');
+const btnSize15 = document.getElementById('btnSize15');
+let experimentFrames = 0;
+let simulationFrames = 0;
+function describeCompareInput(data) {
+  const details = [];
+  if (data?.meta?.input) details.push(`input=${data.meta.input}`);
+  if (data?.source) details.push(`dataSource=${data.source}`);
+  return details.join(' ');
+}
+
+function logCompareLoad(side, source, jsonPath, data) {
+  const suffix = describeCompareInput(data);
+  console.log(
+    `[hemostasis/compare] ${side}=${source} size=${ACTIVE_SIZE.key} json=${jsonPath}${suffix ? ` ${suffix}` : ''}`
+  );
+}
+
+function syncSizeButtons() {
+  btnSize20.classList.toggle('active', ACTIVE_SIZE.key === '20');
+  btnSize15.classList.toggle('active', ACTIVE_SIZE.key === '15');
+}
+
+function switchSize(sizeKey) {
+  if (sizeKey === ACTIVE_SIZE.key) return;
+  const url = new URL(window.location.href);
+  url.searchParams.set('size', sizeKey);
+  window.location.href = url.toString();
+}
+
+async function fetchJsonFromCandidates(paths) {
+  const list = Array.isArray(paths) ? paths : [paths];
+  let lastError = null;
+  for (const path of list) {
+    try {
+      const response = await fetch(path, { cache: 'no-store' });
+      if (!response.ok) throw new Error(path);
+      const data = await response.json();
+      return { data, path };
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError || new Error(list[0] || 'unknown path');
+}
+
+function isGroundTruthMotionData(data) {
+  return data?.source === 'visuoshell_3d_dot'
+    || data?.source === 'experiment'
+    || (data?.source === 'simulation' && String(data?.meta?.input || '').includes('experiment_'));
+}
+
+function findPeakFrameIndex(data) {
+  const frames = data?.frames || [];
+  if (frames.length <= 1) return 0;
+  const base = frames[0];
+  let bestIdx = 0;
+  let bestDisp = -Infinity;
+  for (let fi = 1; fi < frames.length; fi++) {
+    const frame = frames[fi];
+    let disp = 0;
+    for (let i = 0; i < frame.length; i += 3) {
+      const dx = frame[i] - base[i];
+      const dy = frame[i + 1] - base[i + 1];
+      const dz = frame[i + 2] - base[i + 2];
+      disp += Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    if (disp > bestDisp) {
+      bestDisp = disp;
+      bestIdx = fi;
+    }
+  }
+  return bestIdx;
+}
+
+function buildMotionProfile(data) {
+  if (!isGroundTruthMotionData(data)) return null;
+  const frames = data?.frames || [];
+  if (frames.length <= 1) return null;
+  const base = frames[0];
+  const mags = frames.map((frame, fi) => {
+    if (fi === 0) return 0;
+    let disp = 0;
+    for (let i = 0; i < frame.length; i += 3) {
+      const dx = frame[i] - base[i];
+      const dy = frame[i + 1] - base[i + 1];
+      const dz = frame[i + 2] - base[i + 2];
+      disp += Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    return disp;
+  });
+  const peakFrame = findPeakFrameIndex(data);
+  const peakMag = mags[peakFrame] || 0;
+  const motionThresh = peakMag * 0.05;
+  let startFrame = 0;
+  while (startFrame < peakFrame && mags[startFrame] < motionThresh) startFrame++;
+  let endFrame = peakFrame;
+  while (endFrame < mags.length - 1 && mags[endFrame] >= motionThresh) endFrame++;
+  return {
+    startFrame,
+    peakFrame,
+    endFrame,
+    totalFrames: Math.max(1, Math.round((
+      startFrame / (data.fps || 30) + GT_APPROACH_S + GT_HOLD_S + GT_RETURN_S
+      + Math.max(0, (mags.length - 1 - endFrame) / (data.fps || 30))
+    ) * (data.fps || 30))),
+    preIdle: startFrame / (data.fps || 30),
+    postIdle: Math.max(0, (mags.length - 1 - endFrame) / (data.fps || 30)),
+    duration: startFrame / (data.fps || 30) + GT_APPROACH_S + GT_HOLD_S + GT_RETURN_S
+      + Math.max(0, (mags.length - 1 - endFrame) / (data.fps || 30)),
+  };
+}
+
+function mapMotionProfileFrame(tsSeconds) {
+  if (!motionProfile) return null;
+  const start = motionProfile.startFrame;
+  const peak = Math.max(start, motionProfile.peakFrame);
+  const end = Math.max(peak, motionProfile.endFrame);
+  const loopT = ((tsSeconds % motionProfile.duration) + motionProfile.duration) % motionProfile.duration;
+  if (loopT < motionProfile.preIdle) {
+    return 0;
+  }
+  const moveT = loopT - motionProfile.preIdle;
+  if (moveT < GT_APPROACH_S) {
+    return Math.round(start + (moveT / GT_APPROACH_S) * (peak - start));
+  }
+  if (moveT < GT_APPROACH_S + GT_HOLD_S) {
+    return peak;
+  }
+  if (moveT < GT_APPROACH_S + GT_HOLD_S + GT_RETURN_S) {
+    const rel = (moveT - GT_APPROACH_S - GT_HOLD_S) / GT_RETURN_S;
+    return Math.round(peak + rel * (end - peak));
+  }
+  return Math.min(end, maxFrames - 1);
+}
+
+function updateFrameInfo(f = currentFrame) {
+  if (maxFrames > 0) {
+    frameInfo.textContent = `${f} / ${maxFrames-1}  (exp:${experimentFrames}  sim:${simulationFrames} frames)`;
+  }
+}
+
+
+function showFrame(displayFrame, sourceFrame = displayFrame) {
+  currentFrame = displayFrame;
+  slider.value = displayFrame;
+  updateFrameInfo(displayFrame);
+  const displaySeconds = displayFrame / Math.max(fps || 30, 1);
+  leftPanel.setFrame(sourceFrame, displaySeconds);
+  rightPanel.setFrame(sourceFrame, displaySeconds);
+}
+
+let leftLoaded = false;
+let rightLoaded = false;
+function onDataLoaded(panel, data, side) {
+  panel.meshData = data;
+  panel.createMembraneFromData(data);
+  if (side === 'left') {
+    leftLoaded = true;
+    experimentFrames = leftPanel.meshData.frames.length;
+    motionProfile = buildMotionProfile(leftPanel.meshData);
+  } else if (side === 'right') {
+    rightLoaded = true;
+    simulationFrames = rightPanel.meshData.frames.length;
+  }
+  if (leftLoaded && rightLoaded) {
+    maxFrames = motionProfile?.totalFrames ?? Math.max(experimentFrames, simulationFrames);
+    fps = leftPanel.meshData.fps || rightPanel.meshData.fps || 30;
+    slider.max = maxFrames - 1;
+    slider.disabled = false;
+    btnPlay.disabled = false;
+    updateFrameInfo(0);
+    showFrame(0, 0);
+  }
+}
+
+async function loadSimulation() {
+  const paths = ACTIVE_SIZE.simulationDotPaths;
+  try {
+    const { data, path } = await fetchJsonFromCandidates(paths);
+    logCompareLoad('right', 'simulation-dot', path, data);
+    onDataLoaded(rightPanel, data, 'right');
+    const displayFrame = Math.min(currentFrame, Math.max((motionProfile?.totalFrames ?? data.frames.length) - 1, 0));
+    const sourceFrame = motionProfile ? mapMotionProfileFrame(displayFrame / fps) : displayFrame;
+    showFrame(displayFrame, sourceFrame);
+  } catch {
+    frameInfo.textContent = `Error: could not load ${paths[0]}`;
+  }
+}
+
+btnPlay.onclick = () => {
+  playing = !playing;
+  if(playing){ playT0=performance.now(); playF0=currentFrame; }
+  btnPlay.textContent = playing ? '⏸' : '▶';
+};
+slider.oninput = () => {
+  playing=false;
+  btnPlay.textContent='▶';
+  const displayFrame = +slider.value;
+  if (motionProfile) {
+    const sourceFrame = mapMotionProfileFrame(displayFrame / fps);
+    showFrame(displayFrame, sourceFrame);
+  } else {
+    showFrame(displayFrame);
+  }
+};
+
+// ── Camera sync ───────────────────────────────────────────────────────────────
+let _syncingCam   = false;
+let zoomLinked    = false;
+const btnZoomLink = document.getElementById('btnZoomLink');
+const btnSphere = document.getElementById('btnSphere');
+const btnAssembly1 = document.getElementById('btnAssembly1');
+let sphereVisible = true;
+let assembly1Visible = true;
+
+btnZoomLink.onclick = () => {
+  zoomLinked = !zoomLinked;
+  btnZoomLink.classList.toggle('linked', zoomLinked);
+  btnZoomLink.textContent = zoomLinked ? '🔍 Unlink Zoom' : '🔍 Link Zoom';
+  if (zoomLinked) {
+    syncCameraTo(leftPanel, rightPanel);
+  }
+};
+
+btnSphere.onclick = () => {
+  sphereVisible = !sphereVisible;
+  btnSphere.textContent = sphereVisible ? 'Hide Sphere' : 'Show Sphere';
+  [leftPanel, rightPanel].forEach(p => {
+    if (p.sphereBackObj) p.sphereBackObj.visible = sphereVisible;
+  });
+};
+
+btnAssembly1.onclick = () => {
+  assembly1Visible = !assembly1Visible;
+  btnAssembly1.textContent = assembly1Visible ? 'Hide Cylinder' : 'Show Cylinder';
+  [leftPanel, rightPanel].forEach(p => {
+    if (p.assembly1Obj) p.assembly1Obj.visible = assembly1Visible;
+    if (p.assembly1GuideObj) p.assembly1GuideObj.visible = assembly1Visible;
+  });
+};
+
+function syncCameraTo(src, dst) {
+  if (_syncingCam) return;
+  _syncingCam = true;
+  const srcOffset = new THREE.Vector3().subVectors(src.camera.position, src.controls.target);
+  const srcDistance = srcOffset.length();
+  const srcDir = srcDistance > 1e-12 ? srcOffset.clone().multiplyScalar(1 / srcDistance) : new THREE.Vector3(0, 0, 1);
+  const dstDistance = zoomLinked ? srcDistance : dst.camera.position.distanceTo(dst.controls.target);
+  dst.controls.target.copy(src.controls.target);
+  dst.camera.position.copy(dst.controls.target).addScaledVector(srcDir, dstDistance);
+  dst.camera.up.copy(src.camera.up);
+  dst.camera.lookAt(dst.controls.target);
+  dst.controls.update();
+  _syncingCam = false;
+}
+
+// Wire up after panels exist (controls created inside Panel constructor)
+setTimeout(() => {
+  leftPanel.controls.addEventListener('change',  () => syncCameraTo(leftPanel,  rightPanel));
+  rightPanel.controls.addEventListener('change', () => syncCameraTo(rightPanel, leftPanel));
+}, 0);
+
+gltfAssemblyReady.then(scene => {
+  if (!scene) return;
+  [leftPanel, rightPanel].forEach(p => { if (p.meshData) p.addAssembly(scene); });
+});
+
+// Wait for membrane.gltf first so assemblySphereRadius is ready
+Promise.all([gltfAssemblyReady, gltfAssembly1Ready]).then(([, a1scene]) => {
+  if (!a1scene) return;
+  [leftPanel, rightPanel].forEach(p => { if (p.meshData) p.addAssembly1(a1scene); });
+});
+
+async function loadExperiment() {
+  const paths = ACTIVE_SIZE.experimentDotPaths;
+  try {
+    const { data, path } = await fetchJsonFromCandidates(paths);
+    logCompareLoad('left', 'dot', path, data);
+    onDataLoaded(leftPanel, data, 'left');
+    loadSimulation();
+    const displayFrame = Math.min(currentFrame, Math.max((motionProfile?.totalFrames ?? data.frames.length) - 1, 0));
+    const sourceFrame = motionProfile ? mapMotionProfileFrame(displayFrame / fps) : displayFrame;
+    showFrame(displayFrame, sourceFrame);
+  } catch (err) {
+    console.error('[hemostasis/compare] failed to load experiment', err);
+    frameInfo.textContent = `Error: could not load ${paths[0]}`;
+  }
+}
+
+btnSize20.onclick = () => { switchSize('20'); };
+btnSize15.onclick = () => { switchSize('15'); };
+syncSizeButtons();
+
+// ── Fetch both JSONs (wait for GLTF first) ────────────────────────────────────
+loadExperiment();
+
+// ── Resize ────────────────────────────────────────────────────────────────────
+window.addEventListener('resize', () => { leftPanel.resize(); rightPanel.resize(); });
+leftPanel.resize();
+rightPanel.resize();
+
+// ── Render loop ───────────────────────────────────────────────────────────────
+function animate(ts) {
+  requestAnimationFrame(animate);
+  if(playing && maxFrames > 0){
+    const elapsed=(ts-playT0)/1000;
+    if (motionProfile) {
+      const displayFrame = Math.floor(playF0 + elapsed * fps) % motionProfile.totalFrames;
+      const sourceFrame = mapMotionProfileFrame(displayFrame / fps);
+      showFrame(displayFrame, sourceFrame);
+    } else {
+      const f=Math.floor(playF0+elapsed*fps)%maxFrames;
+      showFrame(f);
+    }
+  }
+  leftPanel.tick();
+  rightPanel.tick();
+}
+animate(0);
+
+</script>
+</body>
+</html>

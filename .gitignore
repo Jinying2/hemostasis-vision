@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Video files (raw captures and exports)
+*.mp4
+*.mkv
+*.avi
+
+# Large data files (generated — run pipeline to reproduce)
+*/sphere_3D_nodes.csv
+render/sphere_*.json
+render/experiment_*.json
+render/simulation_*.json
+viewer/stereo_*.json
+
+# Pipeline outputs
+*.png
+
+# Calibration (committed — required for pipeline)
+# fisheye_stereo_calib.npz

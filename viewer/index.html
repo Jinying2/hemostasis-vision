@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Hemostasis Shell Viewer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0d0d0d; overflow: hidden; font-family: 'Courier New', monospace; }
+
+    #panels {
+      display: flex; flex-direction: row;
+      width: 100vw; height: calc(100vh - 46px);
+    }
+    /* Left 2×2 square grid */
+    #left-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: 1fr 1fr;
+      height: 100%; flex: 2;
+      gap: 1px; background: rgba(255,255,255,.08);
+    }
+    /* Right single tall panel */
+    #right-panel {
+      flex: 1; position: relative; overflow: hidden; background: #0d0d0d;
+      border-left: 1px solid rgba(255,255,255,.08);
+    }
+
+    .panel {
+      position: relative; overflow: hidden; background: #0d0d0d;
+    }
+
+    video.cam { width: 100%; height: 100%; object-fit: contain; display: block; }
+    canvas.three { display: block; width: 100%; height: 100%; }
+
+    .panel-label {
+      position: absolute; top: 10px; left: 0; right: 0;
+      text-align: center; font-size: 40px; font-weight: bold;
+      letter-spacing: .07em; color: #c8e44e;
+      pointer-events: none; z-index: 10;
+    }
+
+    .drop-hint {
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      flex-direction: column; gap: 4px;
+      font-size: 13px; color: rgba(255,255,255,.25);
+      border: 1.5px dashed rgba(255,255,255,.12); border-radius: 6px;
+      margin: 10px; cursor: pointer; pointer-events: all;
+      transition: border-color .15s, color .15s;
+    }
+    .drop-hint:hover, .drop-hint.drag {
+      border-color: rgba(255,255,255,.55); color: rgba(255,255,255,.7);
+    }
+    .drop-hint.hidden { display: none; }
+
+    #ctrl {
+      position: fixed; bottom: 0; left: 0; right: 0; height: 46px;
+      background: rgba(0,0,0,.82); display: flex; align-items: center;
+      gap: 10px; padding: 0 14px; z-index: 30; color: #fff;
+    }
+    button {
+      background: #222; color: #bbb; border: 1px solid #393939;
+      padding: 4px 11px; cursor: pointer; border-radius: 4px; font-size: 12px;
+    }
+    button:hover { background: #2f2f2f; }
+    button.on { background: #7a1800; border-color: #c02800; color: #ff9988; }
+    #slider { flex: 1; accent-color: #c8e44e; cursor: pointer; }
+    #info { font-size: 11px; color: #777; white-space: nowrap; min-width: 180px; }
+  </style>
+</head>
+<body>
+
+<div id="panels">
+  <!-- Left 2×2 square grid -->
+  <div id="left-grid">
+    <div class="panel" id="left-panel">
+      <video id="left-video" class="cam" muted playsinline></video>
+      <div class="panel-label">Left Camera Ground Truth</div>
+      <div class="drop-hint" id="hint-left">Click or drop left camera video (.mp4)</div>
+    </div>
+    <div class="panel" id="mid-panel">
+      <video id="right-video" class="cam" muted playsinline></video>
+      <div class="panel-label">Right Camera Ground Truth</div>
+      <div class="drop-hint" id="hint-right">Click or drop right camera video (.mp4)</div>
+    </div>
+    <div class="panel" id="botl-panel">
+      <canvas id="camL-canvas" class="three"></canvas>
+      <div class="panel-label">Left Camera Reconstruction View</div>
+      <div class="drop-hint" id="hint-botl" style="pointer-events:none">Load stereo_experiment.json above</div>
+    </div>
+    <div class="panel" id="botr-panel">
+      <canvas id="camR-canvas" class="three"></canvas>
+      <div class="panel-label">Right Camera Reconstruction View</div>
+      <div class="drop-hint" id="hint-botr" style="pointer-events:none">Load stereo_experiment.json above</div>
+    </div>
+  </div>
+  <!-- Right: 3D reconstruction -->
+  <div id="right-panel">
+    <canvas id="three-canvas" class="three"></canvas>
+    <div class="panel-label" style="top:180px">3D Reconstruction</div>
+    <div class="drop-hint" id="hint-json">
+      Click or drop stereo_experiment.json
+      <small style="opacity:.6">(run viewer/run_and_export.py first)</small>
+    </div>
+  </div>
+</div>
+
+<div id="ctrl">
+  <button id="btnPlay">▶ Play</button>
+  <input type="range" id="slider" min="0" max="0" value="0">
+  <div id="info">Frame: — / —</div>
+  <span id="capStatus" style="font-size:11px;color:#c8e44e"></span>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three":         "https://cdn.jsdelivr.net/npm/three@0.157/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.157/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ── Shared scene ───────────────────────────────────────────────────────────────
+const scene = new THREE.Scene();
+scene.background = null;  // each renderer sets its own clear colour
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const d1 = new THREE.DirectionalLight(0xffffff, 1.3); d1.position.set(2,3,4); scene.add(d1);
+const d2 = new THREE.DirectionalLight(0xffccaa, 0.5); d2.position.set(-3,-1,-2); scene.add(d2);
+
+// ── Renderer 1: face-on (top right) — with OrbitControls ──────────────────────
+const threeCanvas = document.getElementById('three-canvas');
+const rightPanel  = document.getElementById('right-panel');
+const renderer = new THREE.WebGLRenderer({ canvas: threeCanvas, antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setClearColor(0x0d0d0d, 1);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.001, 1e6);
+const controls = new OrbitControls(camera, threeCanvas);
+controls.enableDamping = true; controls.dampingFactor = 0.07;
+
+// ── Renderer 2: left physical camera view (bottom left) ───────────────────────
+const camLCanvas = document.getElementById('camL-canvas');
+const botLPanel  = document.getElementById('botl-panel');
+const rendererL  = new THREE.WebGLRenderer({ canvas: camLCanvas, antialias: true, preserveDrawingBuffer: true });
+rendererL.setPixelRatio(window.devicePixelRatio);
+rendererL.setClearColor(0x0d0d0d, 1);
+const cameraL = new THREE.PerspectiveCamera(55, 1, 0.001, 1e6);
+
+// ── Renderer 3: right physical camera view (bottom right) ─────────────────────
+const camRCanvas = document.getElementById('camR-canvas');
+const botRPanel  = document.getElementById('botr-panel');
+const rendererR  = new THREE.WebGLRenderer({ canvas: camRCanvas, antialias: true, preserveDrawingBuffer: true });
+rendererR.setPixelRatio(window.devicePixelRatio);
+rendererR.setClearColor(0x0d0d0d, 1);
+const cameraR = new THREE.PerspectiveCamera(55, 1, 0.001, 1e6);
+
+// ── Mesh ──────────────────────────────────────────────────────────────────────
+let meshObj = null, meshData = null;
+
+function buildMesh(data) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(data.frames[0]), 3));
+  geo.setIndex(data.faces.flat());
+  geo.computeVertexNormals();
+  const solidMat = new THREE.MeshPhongMaterial({
+    color: 0x4488ee, side: THREE.DoubleSide,
+    shininess: 60, specular: new THREE.Color(0x3366aa), vertexColors: false,
+  });
+  const ptsMat = new THREE.PointsMaterial({ color: 0xffffff, size: 2.5, sizeAttenuation: false });
+  const solid  = new THREE.Mesh(geo, solidMat);
+  const dots   = new THREE.Points(geo, ptsMat);
+  return { geo, solid, dots, solidMat };
+}
+
+// PCA face-on camera for main view
+function fitCamera() {
+  const pos = meshObj.geo.attributes.position.array;
+  const n   = pos.length / 3;
+  let cx=0,cy=0,cz=0;
+  for(let i=0;i<n;i++){cx+=pos[i*3];cy+=pos[i*3+1];cz+=pos[i*3+2];}
+  cx/=n;cy/=n;cz/=n;
+  let c00=0,c01=0,c02=0,c11=0,c12=0,c22=0;
+  for(let i=0;i<n;i++){
+    const dx=pos[i*3]-cx,dy=pos[i*3+1]-cy,dz=pos[i*3+2]-cz;
+    c00+=dx*dx;c01+=dx*dy;c02+=dx*dz;c11+=dy*dy;c12+=dy*dz;c22+=dz*dz;
+  }
+  const tr=c00+c11+c22;
+  let vx=1,vy=0.1,vz=0.1;
+  for(let k=0;k<60;k++){
+    const wx=(tr-c00)*vx-c01*vy-c02*vz;
+    const wy=-c01*vx+(tr-c11)*vy-c12*vz;
+    const wz=-c02*vx-c12*vy+(tr-c22)*vz;
+    const wl=Math.sqrt(wx*wx+wy*wy+wz*wz);
+    vx=wx/wl;vy=wy/wl;vz=wz/wl;
+  }
+  if(vx*cx+vy*cy+vz*cz>0){vx=-vx;vy=-vy;vz=-vz;}
+  const box  = new THREE.Box3().setFromObject(meshObj.solid);
+  const ctr  = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3()).length();
+  controls.target.copy(ctr);
+  camera.position.copy(ctr.clone().add(new THREE.Vector3(vx,vy,vz).multiplyScalar(size*1.6)));
+  camera.up.set(0,-1,0);
+  camera.near=size*0.001; camera.far=size*100;
+  camera.updateProjectionMatrix(); controls.update();
+}
+
+// Physical camera views from stereo extrinsics
+function fitPhysicalCameras() {
+  const pos = meshObj.geo.attributes.position.array;
+  const n   = pos.length / 3;
+  let cx=0,cy=0,cz=0;
+  for(let i=0;i<n;i++){cx+=pos[i*3];cy+=pos[i*3+1];cz+=pos[i*3+2];}
+  cx/=n;cy/=n;cz/=n;
+  const centroid = new THREE.Vector3(cx,cy,cz);
+  const box  = new THREE.Box3().setFromObject(meshObj.solid);
+  const size = box.getSize(new THREE.Vector3()).length();
+  const near = size*0.001, far = size*100;
+
+  // Left camera: optical center at world origin, looks along +Z
+  // Place slightly behind origin so near-plane doesn't clip
+  cameraL.position.set(0, 0, -size*0.05);
+  cameraL.up.set(0,-1,0);
+  cameraL.lookAt(centroid);
+  cameraL.near=near; cameraL.far=far;
+  cameraL.updateProjectionMatrix();
+
+  // Right camera: C_r = -R_ext^T * T_ext
+  const R = meshData.calib ? meshData.calib.R_ext : null;
+  const T = meshData.calib ? meshData.calib.T_ext : null;
+  let rcx, rcy, rcz;
+  if(R && T) {
+    rcx = -(R[0][0]*T[0]+R[1][0]*T[1]+R[2][0]*T[2]);
+    rcy = -(R[0][1]*T[0]+R[1][1]*T[1]+R[2][1]*T[2]);
+    rcz = -(R[0][2]*T[0]+R[1][2]*T[1]+R[2][2]*T[2]);
+  } else {
+    // Fallback: hardcoded from fisheye_stereo_calib.npz
+    rcx=51.688; rcy=1.399; rcz=19.920;
+  }
+  cameraR.position.set(rcx, rcy, rcz);
+  cameraR.up.set(0,-1,0);
+  cameraR.lookAt(centroid);
+  cameraR.near=near; cameraR.far=far;
+  cameraR.updateProjectionMatrix();
+}
+
+function setMeshFrame(f) {
+  if(!meshObj||!meshData) return;
+  const flat=meshData.frames[Math.min(f,meshData.frames.length-1)];
+  meshObj.geo.attributes.position.array.set(flat);
+  meshObj.geo.attributes.position.needsUpdate=true;
+  meshObj.geo.computeVertexNormals();
+}
+
+// ── Load JSON ─────────────────────────────────────────────────────────────────
+const videoL = document.getElementById('left-video');
+const videoR = document.getElementById('right-video');
+const slider  = document.getElementById('slider');
+const infoEl  = document.getElementById('info');
+let fps=30, playing=false, capturing=false;
+let capCanvas=null, capCtx=null;
+
+function loadJSON(data) {
+  fps=data.fps||30;
+  meshData=data;
+  // build sorted timestamp array for binary-search frame lookup
+  meshData._ts = data.timestamps ? new Float64Array(data.timestamps) : null;
+  if(meshObj){scene.remove(meshObj.solid,meshObj.dots);}
+  meshObj=buildMesh(data); scene.add(meshObj.solid,meshObj.dots);
+  fitCamera();
+  fitPhysicalCameras();
+  slider.max=data.frames.length-1;
+  document.getElementById('hint-json').classList.add('hidden');
+  document.getElementById('hint-botl').classList.add('hidden');
+  document.getElementById('hint-botr').classList.add('hidden');
+  infoEl.textContent=`Frame: 0 / ${data.frames.length-1}`;
+}
+
+fetch('stereo_experiment.json').then(r=>r.json()).then(loadJSON).catch(()=>{});
+
+function loadVideoL(src) {
+  videoL.src=src; videoL.load();
+  document.getElementById('hint-left').classList.add('hidden');
+}
+function loadVideoR(src){videoR.src=src;videoR.load();document.getElementById('hint-right').classList.add('hidden');}
+fetch('../raw_left_1775254529.mp4', {method:'HEAD'}).then(r=>{if(r.ok)loadVideoL('../raw_left_1775254529.mp4');}).catch(()=>{});
+fetch('../raw_right_1775254529.mp4',{method:'HEAD'}).then(r=>{if(r.ok)loadVideoR('../raw_right_1775254529.mp4');}).catch(()=>{});
+
+// ── Drop / click ──────────────────────────────────────────────────────────────
+function setupDrop(id, onFile) {
+  const el=document.getElementById(id);
+  el.addEventListener('dragover', e=>{e.preventDefault();el.classList.add('drag');});
+  el.addEventListener('dragleave',()=>el.classList.remove('drag'));
+  el.addEventListener('drop', e=>{e.preventDefault();el.classList.remove('drag');const f=e.dataTransfer.files[0];if(f)onFile(f);});
+  el.addEventListener('click', ()=>{const i=document.createElement('input');i.type='file';i.onchange=e=>{const f=e.target.files[0];if(f)onFile(f);};i.click();});
+}
+setupDrop('hint-left',  f=>loadVideoL(URL.createObjectURL(f)));
+setupDrop('hint-right', f=>loadVideoR(URL.createObjectURL(f)));
+setupDrop('hint-json',  f=>{const r=new FileReader();r.onload=e=>{try{loadJSON(JSON.parse(e.target.result));}catch(err){alert(err.message);}};r.readAsText(f);});
+
+// ── Controls ──────────────────────────────────────────────────────────────────
+const btnPlay = document.getElementById('btnPlay');
+const capStatus = document.getElementById('capStatus');
+
+// ── Recording via MediaRecorder (doesn't touch rAF or performance.now) ────────
+let mediaRec = null, recChunks = [], recStarted = false;
+
+function startRecording() {
+  if(recStarted) return;
+  recStarted = true;
+  capCanvas = document.createElement('canvas');
+  capCanvas.width = window.innerWidth; capCanvas.height = window.innerHeight - 46;
+  capCtx = capCanvas.getContext('2d');
+  const mime = ['video/mp4','video/webm;codecs=vp9','video/webm']
+    .find(m => MediaRecorder.isTypeSupported(m)) || 'video/webm';
+  mediaRec = new MediaRecorder(capCanvas.captureStream(fps), {mimeType: mime, videoBitsPerSecond: 12_000_000});
+  recChunks = [];
+  mediaRec.ondataavailable = e => { if(e.data.size > 0) recChunks.push(e.data); };
+  mediaRec.onstop = () => {
+    const blob = new Blob(recChunks, {type: mime});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'hemostasis.' + (mime.startsWith('video/mp4') ? 'mp4' : 'webm');
+    a.click();
+    capCanvas = null; capCtx = null; mediaRec = null; recChunks = []; recStarted = false;
+    capStatus.textContent = 'Done — check Downloads';
+  };
+  capturing = true;
+  mediaRec.start();
+  capStatus.textContent = '● Recording…';
+  videoL.addEventListener('ended', () => {
+    if(!capturing) return;
+    capturing = false; playing = false;
+    videoL.pause(); videoR.pause();
+    btnPlay.textContent = '▶ Play';
+    capStatus.textContent = 'Saving…';
+    mediaRec.stop();
+  }, {once: true});
+}
+
+btnPlay.onclick = () => {
+  playing = !playing;
+  if(playing) {
+    videoL.play().catch(()=>{}); videoR.play().catch(()=>{});
+    startRecording();
+  } else {
+    videoL.pause(); videoR.pause();
+  }
+  btnPlay.textContent = playing ? '⏸ Pause' : '▶ Play';
+};
+
+slider.oninput = () => {
+  const f = +slider.value;
+  if(videoL.src) videoL.currentTime = f/fps;
+  if(videoR.src) videoR.currentTime = f/fps;
+  setMeshFrame(f);
+  infoEl.textContent = `Frame: ${f} / ${meshData ? meshData.frames.length-1 : '—'}`;
+};
+
+// ── Resize ────────────────────────────────────────────────────────────────────
+function onResize() {
+  const wr=rightPanel.clientWidth, hr=rightPanel.clientHeight;
+  renderer.setSize(wr,hr); camera.aspect=wr/hr; camera.updateProjectionMatrix();
+  const wl=botLPanel.clientWidth, hl=botLPanel.clientHeight;
+  rendererL.setSize(wl,hl); cameraL.aspect=wl/hl; cameraL.updateProjectionMatrix();
+  const wrr=botRPanel.clientWidth, hrr=botRPanel.clientHeight;
+  rendererR.setSize(wrr,hrr); cameraR.aspect=wrr/hrr; cameraR.updateProjectionMatrix();
+}
+window.addEventListener('resize',onResize); onResize();
+
+// ── Render loop ───────────────────────────────────────────────────────────────
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+
+
+  if(meshData && videoL.src && !videoL.paused) {
+    let f;
+    const t = videoL.currentTime;
+    if(meshData._ts) {
+      // binary search for closest timestamp — eliminates fps drift
+      const ts = meshData._ts;
+      let lo=0, hi=ts.length-1;
+      while(lo < hi){ const mid=(lo+hi+1)>>1; if(ts[mid]<=t) lo=mid; else hi=mid-1; }
+      f = lo;
+    } else {
+      f = Math.min(Math.max(0, Math.floor(t*fps)), meshData.frames.length-1);
+    }
+    setMeshFrame(f); slider.value=f;
+    infoEl.textContent=`Frame: ${f} / ${meshData.frames.length-1}`;
+  }
+
+  renderer.render(scene, camera);
+  if(meshObj) { rendererL.render(scene, cameraL); rendererR.render(scene, cameraR); }
+
+  if(capturing && capCtx) {
+    const W=capCanvas.width, H=capCanvas.height;
+    const gW=Math.round(W*2/3), rW=W-gW;
+    const cW=Math.round(gW/2), cH=Math.round(H/2);
+    capCtx.fillStyle='#0d0d0d'; capCtx.fillRect(0,0,W,H);
+
+    // draw video with object-fit:contain (preserve aspect ratio)
+    function drawContain(img, dx, dy, dw, dh) {
+      const sw=img.videoWidth||img.width, sh=img.videoHeight||img.height;
+      if(!sw||!sh){try{capCtx.drawImage(img,dx,dy,dw,dh);}catch(_){}return;}
+      const scale=Math.min(dw/sw, dh/sh);
+      const tw=sw*scale, th=sh*scale;
+      try{capCtx.drawImage(img, dx+(dw-tw)/2, dy+(dh-th)/2, tw, th);}catch(_){}
+    }
+    drawContain(videoL,    0,   0,  cW, cH);
+    drawContain(videoR,   cW,   0,  cW, cH);
+    capCtx.drawImage(camLCanvas,   0,  cH,  cW, cH);
+    capCtx.drawImage(camRCanvas,  cW,  cH,  cW, cH);
+    capCtx.drawImage(threeCanvas, gW,   0,  rW,  H);
+
+    // draw panel labels (HTML overlays aren't captured by drawImage)
+    capCtx.font = 'bold 32px "Courier New",monospace';
+    capCtx.fillStyle = '#c8e44e';
+    capCtx.textAlign = 'center';
+    capCtx.fillText('Left Camera Ground Truth',        cW/2,        32);
+    capCtx.fillText('Right Camera Ground Truth',       cW+cW/2,     32);
+    capCtx.fillText('Left Camera Reconstruction View', cW/2,        cH+32);
+    capCtx.fillText('Right Camera Reconstruction View',cW+cW/2,     cH+32);
+    capCtx.fillText('3D Reconstruction',               gW+rW/2,     180);
+    capCtx.textAlign = 'left';
+  }
+}
+animate();
+</script>
+</body>
+</html>
