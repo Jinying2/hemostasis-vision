@@ -10,6 +10,26 @@ Two monocular fisheye cameras observe a 15×15 dot-grid membrane (~225 markers).
 Blob detection → Stereo matching → LK optical flow → Triangulation → 3D mesh
 ```
 
+## Demo
+
+### 3D Mesh Viewer
+
+<video src="demo/viewer.mov" controls width="100%"></video>
+
+Interactive Three.js viewer showing the triangulated 3D surface of the dot-grid membrane across frames.
+
+### Experiment vs Simulation Comparison
+
+<video src="demo/compare.mov" controls width="100%"></video>
+
+Side-by-side view of the tracked experimental mesh against the spring-mass simulation (`render/compare.html`).
+
+### Experiment vs Real Video
+
+<video src="demo/real_video_viewer.mp4" controls width="100%"></video>
+
+Side-by-side view of the experimental mesh against the real fisheye video feed (`render/compare_real_video.html`).
+
 ## Structure
 
 ```

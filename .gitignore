@@ -10,6 +10,11 @@ __pycache__/
 *.mkv
 *.avi
 
+# Demo videos are committed
+!demo/*.mp4
+!demo/*.mov
+!demo/*.mkv
+
 # Large data files (generated — run pipeline to reproduce)
 */sphere_3D_nodes.csv
 render/sphere_*.json
