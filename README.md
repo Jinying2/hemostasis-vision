@@ -14,19 +14,19 @@ Blob detection → Stereo matching → LK optical flow → Triangulation → 3D 
 
 ### 3D Mesh Viewer
 
-<video src="demo/viewer.mov" controls width="100%"></video>
+<video src="https://github.com/user-attachments/assets/981ada0a-de57-4336-bb3b-1e70bac1dfa5" controls width="100%"></video>
 
 Interactive Three.js viewer showing the triangulated 3D surface of the dot-grid membrane across frames.
 
 ### Experiment vs Simulation Comparison
 
-<video src="demo/compare.mov" controls width="100%"></video>
+<video src="https://github.com/user-attachments/assets/d13a6ca9-0795-4cdf-a111-bc4343e12c45" controls width="100%"></video>
 
 Side-by-side view of the tracked experimental mesh against the spring-mass simulation (`render/compare.html`).
 
 ### Experiment vs Real Video
 
-<video src="demo/real_video_viewer.mp4" controls width="100%"></video>
+<video src="https://github.com/user-attachments/assets/2a9bdc59-e9c8-453f-8703-119025ece97e" controls width="100%"></video>
 
 Side-by-side view of the experimental mesh against the real fisheye video feed (`render/compare_real_video.html`).
 
